@@ -7,10 +7,12 @@ import axios from 'axios';
 import workerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import './App.css';
 
+// Setup PDF.js worker - had issues with this initially
 pdfjs.GlobalWorkerOptions.workerSrc = workerSrc;
 
 const samplePdf = '/sample.pdf';
 
+// Field types available for placement
 const fieldPalette = [
   { type: 'signature', label: 'Signature' },
   { type: 'text', label: 'Text Box' },
@@ -19,12 +21,15 @@ const fieldPalette = [
   { type: 'radio', label: 'Radio' },
 ];
 
+// Default size for new fields (normalized 0-1)
 const defaultBox = {
   widthNorm: 0.24,
   heightNorm: 0.08,
 };
 
-// Convert normalized top-left DOM coords into PDF points (origin bottom-left)
+// Converting DOM coordinates to PDF points
+// This was tricky - DOM uses top-left origin, PDF uses bottom-left
+// Also need to convert from CSS pixels to PDF points (72 DPI)
 const toPdfCoords = (field, pageMeta) => {
   if (!field || !pageMeta?.widthPts || !pageMeta?.heightPts) return null;
   const x = field.xNorm * pageMeta.widthPts;
@@ -34,7 +39,7 @@ const toPdfCoords = (field, pageMeta) => {
   return {
     page: field.page,
     x,
-    y: pageMeta.heightPts - yTop - height, // flip from top-left (DOM) to bottom-left (PDF)
+    y: pageMeta.heightPts - yTop - height, // flip Y axis from top-left to bottom-left
     width: field.widthNorm * pageMeta.widthPts,
     height,
     pageWidth: pageMeta.widthPts,
@@ -43,7 +48,6 @@ const toPdfCoords = (field, pageMeta) => {
 };
 
 function App() {
-  const [numPages, setNumPages] = useState(null);
   const [pageMeta, setPageMeta] = useState({ widthPts: null, heightPts: null });
   const [renderSize, setRenderSize] = useState({ width: 0 });
   const [fields, setFields] = useState([]);
@@ -54,6 +58,7 @@ function App() {
   const sigPadRef = useRef(null);
   const pageWrapperRef = useRef(null);
 
+  // Watch for PDF viewer resize so we can recalculate field positions
   useEffect(() => {
     if (!pageWrapperRef.current) return;
     const observer = new ResizeObserver((entries) => {
@@ -74,16 +79,17 @@ function App() {
     [selectedField, pageMeta]
   );
 
-  const handleDocumentLoad = ({ numPages: total }) => {
-    setNumPages(total);
+  const handleDocumentLoad = () => {
     setPdfError('');
   };
 
+  // Extract page dimensions in points when page loads
   const handlePageLoad = (page) => {
     const [xMin, yMin, xMax, yMax] = page.view;
     setPageMeta({ widthPts: xMax - xMin, heightPts: yMax - yMin });
   };
 
+  // Add a new field to the PDF - slightly offset each one so they don't stack
   const addField = (type) => {
     const id = crypto.randomUUID();
     setFields((prev) => [
@@ -102,6 +108,8 @@ function App() {
     setSelectedId(id);
   };
 
+  // Update field position - convert pixel coords to normalized (0-1)
+  // This keeps fields anchored when PDF viewer resizes
   const updateFieldPosition = (id, { x, y }, renderHeight) => {
     setFields((prev) =>
       prev.map((f) =>
@@ -116,6 +124,7 @@ function App() {
     );
   };
 
+  // Update field size - also normalized for responsiveness
   const updateFieldSize = (id, { width, height }, renderHeight) => {
     setFields((prev) =>
       prev.map((f) =>
@@ -138,11 +147,32 @@ function App() {
     sigPadRef.current?.clear();
   };
 
+  // Save the drawn signature as a data URL and attach to selected field
   const saveSignature = () => {
     if (!sigPadRef.current || sigPadRef.current.isEmpty() || !selectedField) return;
     updateFieldValue(selectedField.id, sigPadRef.current.toDataURL('image/png'));
   };
 
+  // Download the signed PDF with a timestamped filename
+  const handleDownload = async () => {
+    if (!signedUrl) return;
+    try {
+      const response = await fetch(signedUrl);
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `signed-document-${dayjs().format('YYYY-MM-DD-HHmmss')}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (error) {
+      setStatus('Failed to download PDF');
+    }
+  };
+
+  // Send all signatures to backend for burning into PDF
   const handleSign = async () => {
     setStatus('');
     setSignedUrl('');
@@ -151,31 +181,38 @@ function App() {
       return;
     }
 
-    const signatureField = fields.find(
+    // Find all signature fields that have been filled in
+    const signatureFields = fields.filter(
       (f) => f.type === 'signature' && f.value && f.page === 1
     );
-    if (!signatureField) {
+    if (signatureFields.length === 0) {
       setStatus('Add a signature field and draw a signature.');
       return;
     }
 
-    const coords = toPdfCoords(signatureField, pageMeta);
     const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:4000';
 
     try {
-      setStatus('Signing PDF...');
+      setStatus(`Signing PDF with ${signatureFields.length} signature(s)...`);
+      
+      // Convert each signature field to the format backend expects
+      const signatures = signatureFields.map((field) => ({
+        signatureDataUrl: field.value,
+        coordinates: toPdfCoords(field, pageMeta),
+      }));
+
       const { data } = await axios.post(`${apiBase}/sign-pdf`, {
         pdfId: 'default',
-        signatureDataUrl: signatureField.value,
-        coordinates: coords,
+        signatures,
       });
       setSignedUrl(data.signedUrl);
-      setStatus('Success! Signed PDF ready below.');
+      setStatus('Success! Signed PDF ready.');
     } catch (error) {
       setStatus(error.response?.data?.message || error.message || 'Failed to sign');
     }
   };
 
+  // Show appropriate label for each field type
   const renderLabel = (field) => {
     if (field.type === 'signature') return field.value ? 'Signed' : 'Signature';
     if (field.type === 'date') return field.value || 'Date';
@@ -188,14 +225,30 @@ function App() {
     <div className="app">
       <header className="topbar">
         <div>
-          <h1>BoloForms Signature Injection Prototype</h1>
-          <p className="subtitle">
-            Drag, resize, and anchor fields. Coordinates stay stable across viewports.
-          </p>
+          <h1>BoloForms Signature</h1>
+          <p className="subtitle">Digital document signing and field placement</p>
         </div>
-        <button className="primary" onClick={handleSign}>
-          Burn Signature
-        </button>
+        <div className="header-actions">
+          <div className="status-indicator">
+            <div className="status-content">
+              <span className="status-label">Status:</span>
+              <span className="status-value">{status || 'Idle'}</span>
+              {signedUrl && (
+                <a className="status-link" href={signedUrl} target="_blank" rel="noreferrer">
+                  Open signed PDF
+                </a>
+              )}
+            </div>
+          </div>
+          {signedUrl && (
+            <button className="secondary" onClick={handleDownload}>
+              Download PDF
+            </button>
+          )}
+          <button className="primary" onClick={handleSign}>
+            Burn Signature
+          </button>
+        </div>
       </header>
 
       <main className="layout">
@@ -281,15 +334,6 @@ function App() {
             )}
           </div>
 
-          <div className="panel status">
-            <h4>Status</h4>
-            <p className="meta">{status || 'Idle'}</p>
-            {signedUrl && (
-              <a className="link" href={signedUrl} target="_blank" rel="noreferrer">
-                Open signed PDF
-              </a>
-            )}
-          </div>
         </aside>
 
         <section className="canvas">
@@ -311,6 +355,7 @@ function App() {
               />
             </Document>
             {pdfError && <p className="error">{pdfError}</p>}
+            {/* Overlay for draggable fields - positioned absolutely over PDF */}
             {renderSize.width > 0 && pageMeta.widthPts && pageMeta.heightPts && (
               <div
                 className="overlay"
@@ -320,6 +365,7 @@ function App() {
                 }}
               >
                 {fields.map((field) => {
+                  // Calculate actual pixel positions from normalized coords
                   const renderHeight =
                     (renderSize.width * pageMeta.heightPts) / pageMeta.widthPts;
                   const x = field.xNorm * renderSize.width;
